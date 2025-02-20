@@ -1,0 +1,339 @@
+-- Services initialization for core Roblox functionality
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--[[ Configuration Block
+     These values control the core mechanics and feel of the grappling hook.
+     - GRAPPLE_KEY: The key that triggers the grappling action
+     - MAX_DISTANCE: Maximum range the hook can travel
+     - GRAPPLE_SPEED: How fast the player moves when grappling
+     - PULL_FORCE: The strength of the force applied to the player
+     - SWING_DAMPING: Reduces swing amplitude over time
+     - MOVEMENT_INFLUENCE: How much WASD inputs affect grapple movement
+     - MOMENTUM_PRESERVATION: Multiplier for maintaining velocity after release
+]]
+local CONFIG = {
+    GRAPPLE_KEY = Enum.KeyCode.E,
+    MAX_DISTANCE = 300,
+    GRAPPLE_SPEED = 200,         
+    PULL_FORCE = 4000,          
+    SWING_DAMPING = 0.1,        
+    MOVEMENT_INFLUENCE = 250,     
+    MOMENTUM_PRESERVATION = 5,  
+    RAYCAST_PARAMS = RaycastParams.new(),
+
+    -- Define which materials can be grappled to
+    -- This creates a lookup table for quick material checks
+    GRAPPABLE_MATERIALS = {
+        [Enum.Material.Brick] = true,
+        [Enum.Material.Concrete] = true,
+        [Enum.Material.Metal] = true,
+        [Enum.Material.Wood] = true,
+        [Enum.Material.Plastic] = true,
+    }
+}
+
+-- Configure raycast to exclude certain objects
+CONFIG.RAYCAST_PARAMS.FilterType = Enum.RaycastFilterType.Exclude
+
+--[[ Main initialization function
+     Sets up all necessary components for the grappling hook system:
+     1. Character references and camera
+     2. Visual elements (rope and hook point)
+     3. Physics handlers
+     4. Input detection
+     5. Movement state tracking
+]]
+local function initGrappleHook(player)
+    -- Wait for and store character components
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:WaitForChild("Humanoid")
+    local hrp = character:WaitForChild("HumanoidRootPart")
+    local camera = workspace.CurrentCamera
+    local mouse = player:GetMouse()
+
+    --[[ Movement System
+         Creates a mapping of WASD keys to their corresponding movement vectors
+         Uses a dictionary to track currently pressed keys for smooth movement
+    ]]
+    local movementKeys = {
+        [Enum.KeyCode.W] = Vector3.new(0, 0, -1),
+        [Enum.KeyCode.S] = Vector3.new(0, 0, 1),
+        [Enum.KeyCode.A] = Vector3.new(-1, 0, 0),
+        [Enum.KeyCode.D] = Vector3.new(1, 0, 0)
+    }
+    local activeKeys = {}
+
+    --[[ Visual Rope Setup
+         Creates a beam instance to represent the grappling rope
+         - Uses attachments to connect between player and hook point
+         - Configures appearance (width, color, texture)
+         - Initially disabled until grapple is active
+    ]]
+    local rope = Instance.new("Beam")
+    rope.Width0 = 0.2
+    rope.Width1 = 0.2
+    rope.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.1),
+        NumberSequenceKeypoint.new(1, 0.1)
+    })
+    rope.Color = ColorSequence.new(Color3.fromRGB(80, 80, 80))
+    rope.TextureSpeed = 1
+    rope.Texture = "rbxassetid://7549619600"
+    rope.Enabled = false
+
+    -- Create attachment points for the rope
+    local attachment0 = Instance.new("Attachment")
+    attachment0.Position = Vector3.new(0, 0.5, 0)
+    attachment0.Parent = hrp
+
+    local attachment1 = Instance.new("Attachment")
+    attachment1.Parent = workspace.Terrain
+
+    rope.Attachment0 = attachment0
+    rope.Attachment1 = attachment1
+    rope.Parent = hrp
+
+    --[[ Hook Point Visualization
+         Creates a small sphere to show where the grapple connects
+         - Normally invisible (Transparency = 1)
+         - Becomes visible when grapple is active
+    ]]
+    local hookPoint = Instance.new("Part")
+    hookPoint.Size = Vector3.new(0.5, 0.5, 0.5)
+    hookPoint.Anchored = true
+    hookPoint.CanCollide = false
+    hookPoint.Material = Enum.Material.Neon
+    hookPoint.Shape = Enum.PartType.Ball
+    hookPoint.BrickColor = BrickColor.new("Bright red")
+    hookPoint.Transparency = 1
+    hookPoint.Parent = workspace
+
+    --[[ Grapple State Management
+         Tracks the current state of the grappling hook system:
+         - active: whether grapple is currently in use
+         - grapplePoint: world position where hook is attached
+         - bodyVelocity: physics object controlling player movement
+         - lastVelocity: stored for momentum preservation
+    ]]
+    local grappleState = {
+        active = false,
+        grapplePoint = nil,
+        bodyVelocity = nil,
+        lastVelocity = Vector3.new(0, 0, 0)
+    }
+
+    --[[ Movement Direction Calculator
+         Combines all active movement keys into a single normalized direction vector
+         Used to apply WASD influence during grappling
+    ]]
+    local function getMovementDirection()
+        local moveDir = Vector3.new(0, 0, 0)
+        for key, dir in pairs(movementKeys) do
+            if activeKeys[key] then
+                moveDir = moveDir + dir
+            end
+        end
+        if moveDir.Magnitude > 0 then
+            moveDir = moveDir.Unit
+        end
+        return moveDir
+    end
+
+    --[[ Surface Validation
+         Checks if a surface can be grappled to based on:
+         1. Custom "Grappable" attribute if present
+         2. Surface material from CONFIG.GRAPPABLE_MATERIALS
+         3. Basic validity checks (collision enabled, not part of character)
+    ]]
+    local function isSurfaceGrappable(part)
+        local isGrappable = part:GetAttribute("Grappable")
+        if isGrappable ~= nil then
+            return isGrappable
+        end
+        return part and part.CanCollide and 
+            not part:IsDescendantOf(character) and 
+            part.Name ~= "HookPoint" and
+            (CONFIG.GRAPPABLE_MATERIALS[part.Material] == true)
+    end
+
+    --[[ Physics Setup
+         Creates or recreates the BodyVelocity instance that controls player movement
+         during grappling. Configures force and damping parameters from CONFIG
+    ]]
+    local function createGrapplePhysics()
+        if grappleState.bodyVelocity then
+            grappleState.bodyVelocity:Destroy()
+        end
+
+        local bodyVelocity = Instance.new("BodyVelocity")
+        bodyVelocity.MaxForce = Vector3.new(1, 1, 1) * CONFIG.PULL_FORCE
+        bodyVelocity.P = 1000
+        bodyVelocity.Parent = hrp
+        grappleState.bodyVelocity = bodyVelocity
+    end
+
+    --[[ Grapple Initiation
+         Handles the start of a grapple attempt:
+         1. Performs raycast from camera to mouse position
+         2. Validates target surface
+         3. Sets up visual elements (rope and hook point)
+         4. Initializes physics for movement
+    ]]
+    local function startGrapple()
+        if grappleState.active then return end
+
+        local mousePos = mouse.Hit.Position
+        local rayOrigin = camera.CFrame.Position
+        local rayDirection = (mousePos - rayOrigin)
+
+        if rayDirection.Magnitude > 0 then
+            rayDirection = rayDirection.Unit * CONFIG.MAX_DISTANCE
+        else
+            return
+        end
+
+        CONFIG.RAYCAST_PARAMS.FilterDescendantsInstances = {character, hookPoint}
+
+        local raycastResult = workspace:Raycast(
+            rayOrigin,
+            rayDirection,
+            CONFIG.RAYCAST_PARAMS
+        )
+
+        if raycastResult and isSurfaceGrappable(raycastResult.Instance) then
+            grappleState.grapplePoint = raycastResult.Position
+            grappleState.active = true
+
+            hookPoint.Position = grappleState.grapplePoint
+            hookPoint.Transparency = 0
+
+            attachment1.WorldPosition = grappleState.grapplePoint
+            rope.Enabled = true
+
+            createGrapplePhysics()
+            humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+        end
+    end
+
+    --[[ Grapple Termination
+         Handles ending the grapple:
+         1. Disables visual elements
+         2. Preserves momentum based on CONFIG.MOMENTUM_PRESERVATION
+         3. Creates temporary physics object for smooth transition
+         4. Returns character to normal movement state
+    ]]
+    local function stopGrapple()
+        if not grappleState.active then return end
+
+        grappleState.active = false
+        rope.Enabled = false
+        hookPoint.Transparency = 1
+
+        -- Create temporary momentum preservation
+        local momentumVelocity = Instance.new("BodyVelocity")
+        momentumVelocity.MaxForce = Vector3.new(1, 1, 1) * CONFIG.PULL_FORCE
+        momentumVelocity.P = 1000
+        momentumVelocity.Velocity = grappleState.lastVelocity * CONFIG.MOMENTUM_PRESERVATION
+        momentumVelocity.Parent = hrp
+
+        -- Clean up grapple physics
+        if grappleState.bodyVelocity then
+            grappleState.bodyVelocity:Destroy()
+            grappleState.bodyVelocity = nil
+        end
+
+        -- Remove momentum preservation after delay
+        task.delay(5, function()
+            if momentumVelocity then
+                momentumVelocity:Destroy()
+            end
+        end)
+
+        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+
+    --[[ Physics Update Loop
+         Runs every frame when grapple is active:
+         1. Calculates pull direction towards grapple point
+         2. Applies WASD movement influence
+         3. Updates velocity and visual elements
+         4. Stores velocity for momentum preservation
+    ]]
+    RunService.Heartbeat:Connect(function(dt)
+        if not grappleState.active or not grappleState.bodyVelocity then return end
+
+        local hookVector = grappleState.grapplePoint - hrp.Position
+        local hookDir = hookVector.Unit
+
+        -- Calculate base pull velocity
+        local pullVelocity = hookDir * CONFIG.GRAPPLE_SPEED
+
+        -- Calculate and apply WASD influence
+        local moveDir = getMovementDirection()
+        local lookVector = camera.CFrame.LookVector
+        local rightVector = camera.CFrame.RightVector
+        local worldMoveDir = (rightVector * moveDir.X + lookVector * moveDir.Z).Unit
+
+        -- Combine movements for final velocity
+        local finalVelocity = pullVelocity
+        if worldMoveDir.Magnitude > 0 then
+            finalVelocity = finalVelocity + worldMoveDir * CONFIG.MOVEMENT_INFLUENCE
+        end
+
+        -- Store velocity for momentum preservation
+        grappleState.lastVelocity = finalVelocity
+
+        -- Update physics and visuals
+        grappleState.bodyVelocity.Velocity = finalVelocity
+        attachment0.WorldPosition = hrp.Position + Vector3.new(0, 1, 0)
+    end)
+
+    --[[ Input Handler Setup
+         Connects input events for:
+         1. Grapple activation/deactivation
+         2. WASD movement tracking
+    ]]
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+
+        if input.KeyCode == CONFIG.GRAPPLE_KEY then
+            startGrapple()
+        end
+
+        if movementKeys[input.KeyCode] then
+            activeKeys[input.KeyCode] = true
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input, gameProcessed)
+        if input.KeyCode == CONFIG.GRAPPLE_KEY then
+            stopGrapple()
+        end
+
+        if movementKeys[input.KeyCode] then
+            activeKeys[input.KeyCode] = nil
+        end
+    end)
+end
+
+-- Initialize system for local player
+local player = Players.LocalPlayer
+player.CharacterAdded:Connect(function(character)
+    initGrappleHook(player)
+end)
+
+-- Handle case where character already exists
+if player.Character then
+    task.spawn(function()
+        task.wait(1)
+        initGrappleHook(player)
+    end)
+end
+
+-- Create RemoteEvent for potential server communication
+local GrappleEvent = Instance.new("RemoteEvent")
+GrappleEvent.Name = "GrappleHookEvent"
+GrappleEvent.Parent = ReplicatedStorage
